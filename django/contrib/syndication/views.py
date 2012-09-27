@@ -9,6 +9,7 @@ from django.utils import feedgenerator, tzinfo
 from django.utils.encoding import force_text, iri_to_uri, smart_text
 from django.utils.html import escape
 from django.utils.timezone import is_naive
+from django.views.generic import View
 
 
 def add_domain(domain, url, secure=False):
@@ -21,6 +22,7 @@ def add_domain(domain, url, secure=False):
             or url.startswith('mailto:')):
         url = iri_to_uri('%s://%s%s' % (protocol, domain, url))
     return url
+
 
 class FeedDoesNotExist(ObjectDoesNotExist):
     pass
@@ -185,3 +187,115 @@ class Feed(object):
                 **self.item_extra_kwargs(item)
             )
         return feed
+
+
+class FeedView(View):
+    feed_class = feedgenerator.DefaultFeed
+    feed_elements = ('title', 'subtitle', 'link', 'description', 'language',
+                     'feed_url', 'author_name', 'author_link', 'author_email',
+                     'categories', 'feed_copyright', 'feed_guid', 'ttl')
+    item_elements = ('title', 'link', 'description', 'unique_id', 'enclosure',
+                     'pubdate', 'author_name', 'author_link', 'categories',
+                     'item_copyright')
+
+    def __init__(self, **kwargs):
+        super(FeedView, self).__init__(**kwargs)
+        self._template_cache = {}
+        self.site = get_current_site(self.request)
+
+    def add_domain(self, url):
+        return add_domain(self.site.domain, url, self.request.is_secure())
+
+    def get_template(self, item_or_feed, element):
+        template_attr = "%s_%s_template" % (item_or_feed, element)
+        template_name = getattr(self, 'template_name', None)
+
+        if template_name is None:
+            raise TemplateDoesNotExist(template_name)
+
+        # May raise TemplateDoesNotExist; that's fine, since it's caught.
+        return loader.get_template(template_name)
+
+    def render_template(self, template, extra_context=None):
+        context = RequestContext(self.request, {'site': self.site})
+        if extra_context is not None:
+            context.update(extra_context)
+        return template.render(context)
+
+    def _get_element(self, item_or_feed, element, extra_context=None):
+        template_cache = self._template_cache.setdefault(item_or_feed, {})
+        if element in template_cache:
+            template = template_cache[element]
+        else:
+            try:
+                template = self.get_template(item_or_feed, element)
+            except TemplateDoesNotExist:
+                template = None
+            template_cache[element] = template
+
+        if template is not None:
+            return self.render_template(template, extra_context)
+
+        attr_name = "get_item_%s" % element
+        meth = getattr(self, attr_name, None)
+        if meth is None:
+            return None
+        return meth(item)
+
+    def get_feed_element(self, element):
+        return self._get_element('feed', element)
+
+    def get_item_element(self, item, element):
+        return self._get_element('item', element, extra_context={'obj': item})
+
+    def get_feed_kwargs(self):
+        kwargs = {}
+        for element in self.feed_elements:
+            kwargs[element] = self.get_feed_element(element)
+        return kwargs
+
+    def get_item_kwargs(self, item):
+        kwargs = {}
+        for element in self.item_elements:
+            kwargs[element] = self.get_item_element(item, element)
+        return kwargs
+
+    def get_feed(self):
+        return self.feed_class(**self.get_feed_kwargs())
+
+    def get_items(self):
+        raise NotImplementedError
+
+    def add_item(self, item, feed):
+        feed.add_item(**self.get_item_kwargs(item))
+
+    # Defaults for feed element values.
+    def get_feed_title(self):
+        raise NotImplementedError
+
+    def get_feed_link(self):
+        raise NotImplementedError
+
+    def get_feed_description(self):
+        raise NotImplementedError
+
+    def get_feed_feed_url(self):
+        return self.add_domain(self.request.path)
+
+    def get_feed_language(self):
+        return settings.LANGUAGE_CODE.decode()
+
+    # Defaults for item element values.
+    def get_item_title(self, item):
+        # Titles should be double escaped by default (see #6533)
+        return escape(force_text(item))
+
+    def get_item_description(self, item):
+        return force_text(item)
+
+    def get_item_link(self, item):
+        try:
+            url = item.get_absolute_url()
+        except AttributeError:
+            raise ImproperlyConfigured('Give your %s class a get_absolute_url() method, or define an item_link() method in your Feed class.' % item.__class__.__name__)
+        return self.add_domain(url)
